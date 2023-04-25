@@ -1,2 +1,2 @@
-# dotfiles
-Whrere I out my configs
+# Dotfiles
+Whrere I put my configs
