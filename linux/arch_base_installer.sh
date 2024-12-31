@@ -1,34 +1,52 @@
 #!/usr/bin/env bash
+# Considerar https://github.com/Thann/arcrypt as post install
 
-# Script de inatalação arch linux baseado no do Dave
-# https://github.com/deepbsd/Farchi/blob/master/farchi.sh
+# Constants for better maintainability
+declare -r YES_PATTERN="^[yY]"
+declare -r DEFAULT_LVM=0
+declare -r DEFAULT_CRYPT=1
+
 ##########################################
 ######     GLOBAL PREFERENCES   ##########
 ##########################################
 
 # Configuração básica
-# Alterar se necessário
 HOSTNAME="archie"
-KEYBOARD="br"      
+KEYBOARD="br"      # Alterar se necessário
 default_keymap='br-abnt'             # set to your keymap name
 TIME_ZONE="America/Sao_Paulo"
 LOCALE="pt_BR.UTF-8"
 FILESYSTEM="ext4"
-## Change these for YOUR installation.  I'm using a 15G VM
 SWAP_SIZE="1G"
 ROOT_SIZE="10G"
 HOME_SIZE=""       # O restante do espaço após as partições
 
 IN_DEVICE="/dev/sda"  # Caminho do dispositivo de instalação
-VUSE_LVM=0
-VUSE_CRYPT=0
-use_lvm(){ return $VUSE_LVM; }       # return 0 if you want lvm
-use_crypt(){ return $VUSE_CRYPT; }     # return 0 if you want crypt
-
+use_lvm=0   # return 0 if you want lvm
+use_crypt=0 # return 0 if you want crypt
 # Funções utilitárias
+
+# Function to get user choice with default value
+get_user_choice() {
+    local prompt="$1"
+    local default_value="$2"
+    local response
+
+    read -p "$prompt" response
+
+    # Return default if empty response
+    if [[ -z "$response" ]]; then
+        echo "$default_value"
+        return
+    fi
+
+    # Convert response to binary (0/1)
+    [[ "$response" =~ $YES_PATTERN ]] && echo "0" || echo "1"
+}
+
 validate_device() {
     local device="$1"
-    [[ -b "$device" ]] || error "O dispositivo $device não existe ou não é válido."
+    [[ -b "$device" ]] || error $LINENO "O dispositivo $device não existe ou não é válido."
 }
 # Verifica o modo de inicialização (UEFI ou BIOS)
 efi_boot_mode() {
@@ -37,7 +55,7 @@ efi_boot_mode() {
 
 # Solicita o caminho do disco
 get_disk_path() {
-    blkid -o device
+    fdisk -l
     echo "Qual é o caminho do disco? (Ex: /dev/sda)"
     read -r IN_DEVICE
     validate_device "$IN_DEVICE"
@@ -55,50 +73,77 @@ check_network_connection() {
 	done
     echo "Testando conexão com a internet..."
     if ! ping -c 3 archlinux.org &>/dev/null; then
-        error "Erro: Não conectado à rede!"
+        error $LINENO "Não conectado à rede!" # Rastreia a linha onde o erro vai ocorrer
     fi
     echo "Conexão estabelecida com sucesso!"
 }
 
 # Exibe e sai com erro
+# Função para rastrear a linha onde ocorreu o erro
 error() {
-    echo "Erro: $1" && exit 1
+    ERROR_LINE=$1  # A linha de erro é passada como argumento para a função
+    ERROR_MSG=$2  # Mensagem de erro personalisada
+    # track_error_line $1 $2
+    return 1
+}
+# Add a logging function
+log() {
+    local level="$1"
+    local message="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message"
 }
 
+# Set error handling
+set -eE
+# Improve error handling
+error_handler() {
+    local exit_code=$?
+    local line_number=$ERROR_LINE
+    if [ -z $line_number ]; then
+        line_number=$1
+    fi
+    if [ $exit_code -ne 0 ]; then
+        log "ERROR" "Command '${BASH_COMMAND}' failed at line $line_number. $ERROR_MSG"
+        exit $exit_code
+    fi
+}
+
+# trap 'error_handler $? $LINENO' ERR
+trap 'error_handler ${LINENO}' ERR
 # Monta a partição com verificação
 mount_it() {
     local device=$1
     local mount_point=$2
-    mount "$device" "$mount_point" || error "Falha ao montar $device em $mount_point"
+    mount "$device" "$mount_point" || error $LINENO "Falha ao montar $device em $mount_point"
 }
 
 # Formata a partição
 format_it() {
     local device=$1
     local fstype=$2
-    mkfs."$fstype" "$device" || error "Falha ao formatar $device com $fstype"
+    mkfs."$fstype" "$device" || error $LINENO "Falha ao formatar $device com $fstype"
 }
 
 # Criação de partições para sistemas UEFI ou BIOS
 ### PARTITION AND FORMAT AND MOUNT
+# Main partition creation function
 create_partitions() {
     clear
 	echo -e "\n\nPartitioning Hard Drive!! Press any key to continue... \n" ; read empty
-	read -p "Use LVM? (Y/N) " VUSE_LVM
-	if [[ "$VUSE_LVM" =~ [yY] ]]; then
-	   VUSE_LVM=0
-	else
-	   VUSE_LVM=1
-	fi
 
-	read -p "Use Crypt? (Y/N) " VUSE_CRYPT
-	if [[ "$VUSE_CRYPT" =~ [yY] ]]; then
-	   VUSE_CRYPT=0
-	else
-	   VUSE_CRYPT=1
-	fi
+    # Get LVM preference with default
+    use_lvm=$(get_user_choice "Use LVM (Logical Volume Manager)? (Y/N) " "$DEFAULT_LVM")
 
-	partition_name_and_size
+    # Get encryption preference with default
+    use_crypt=$(get_user_choice "Use Crypt? (Y/N) " "$DEFAULT_CRYPT")
+
+    # Validate configuration
+    if ! validate_partition_config "$use_lvm" "$use_crypt"; then
+        read -p "Continue anyway? (Y/N) " continue_anyway
+        [[ ! "$continue_anyway" =~ $YES_PATTERN ]] && return 1
+    fi
+
+	set_partition_name_and_size
 
 	if use_lvm ; then
         lvm_create
@@ -106,7 +151,18 @@ create_partitions() {
         non_lvm_create
     fi
 }
-partition_name_and_size(){
+validate_partition_config() {
+    local use_lvm="$1"
+    local use_crypt="$2"
+
+    # Add validation logic here
+    if [[ "$use_crypt" -eq 0 && "$use_lvm" -eq 1 ]]; then
+        echo "Warning: Encryption without LVM might not be optimal"
+        return 1
+    fi
+    return 0
+}
+set_partition_name_and_size(){
     # If IN_DEV is nvme then slices are p1, p2 etc
     if  efi_boot_mode ; then
         EFI_SIZE=512M
@@ -147,7 +203,7 @@ partition_name_and_size(){
 format_device() {
     local device="$1"
     local fstype="$2"
-    mkfs."$fstype" "$device" || error "Não foi possível formatar $device como $fstype."
+    mkfs."$fstype" "$device" || error $LINENO "Não foi possível formatar $device como $fstype."
 }
 
 # ENCRYPT DISK WHEN POWER IS OFF
@@ -167,10 +223,10 @@ END_OF_MSG
 
     cryptsetup luksOpen  $1 sda_crypt
     echo "Wiping every byte of device with zeros, could take a while..."
-    dd if=/dev/zero of=/dev/mapper/sda_crypt bs=1M
+    dd if=/dev/zero of=/dev/mapper/sda_crypt bs=1M status=progress
     cryptsetup luksClose sda_crypt
     echo "Filling header of device with random data..."
-    dd if=/dev/urandom of="$1" bs=512 count=20480
+    dd if=/dev/urandom of="$1" bs=512 count=20480 status=progress
 }
 
 non_lvm_create(){
@@ -245,6 +301,9 @@ lvm_create(){
         mkfs.fat -F32 "$EFI_DEVICE"
     else
         #  # Create the slice for the Volume Group as first and only slice
+    log "DEBUG" "Creating slice for the Volume Group as first and only slice"
+    log "DEBUG" "DEVICE: $IN_DEVICE"
+    log "DEBUG" "BOOT_DEVICE: $BOOT_DEVICE"
 
 cat > /tmp/sfdisk.cmd << EOF
 $BOOT_DEVICE : start= 2048, size=+$BOOT_SIZE, type=83, bootable
@@ -316,7 +375,7 @@ install_base_system() {
     echo "Instalando pacotes básicos: " "${BASE_SYSTEM[@]}"
     pacstrap -K /mnt "${BASE_SYSTEM[@]}"
     ## UPDATE mkinitrd HOOKS if using LVM
-    use_lvm && arch-chroot /mnt pacman -S lvm2
+    use_lvm && arch-chroot /mnt pacman -S lvm2 -y
     use_lvm && lvm_hooks
 
     echo "Base do sistema instalada."
@@ -369,7 +428,7 @@ HOSTS
 enabling_essentials(){
     clear
     echo && echo -e "\n\nEnabling dhcpcd, pambase, sshd and NetworkManager services..." && echo
-    arch-chroot /mnt pacman -S openssh man-pages pambase git
+    arch-chroot /mnt pacman -S openssh man-pages pambase git -y
     arch-chroot /mnt systemctl enable dhcpcd.service
     arch-chroot /mnt systemctl enable sshd.service
     arch-chroot /mnt systemctl enable NetworkManager.service
@@ -381,7 +440,7 @@ add_user(){
     clear
     echo && echo -e "\n\nAdding sudo + user acct..."
     sleep 2
-    arch-chroot /mnt pacman -S sudo bash-completion sshpass
+    arch-chroot /mnt pacman -S sudo bash-completion sshpass -y
     arch-chroot /mnt sed -i 's/# %wheel/%wheel/g' /etc/sudoers
     arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) NOPASSWD: ALL/# %wheel ALL=(ALL) NOPASSWD: ALL/g' /etc/sudoers
     # Caso usuariuo n isnira um nome por acidente
@@ -398,11 +457,11 @@ add_user(){
 # Configuração do GRUB
 install_grub() {
     echo "Instalando e configurando o GRUB..."
-    arch-chroot /mnt pacman -S grub os-prober
+    arch-chroot /mnt pacman -S grub os-prober -y
     if efi_boot_mode; then
-        arch-chroot /mnt pacman -S efibootmgr
+        arch-chroot /mnt pacman -S efibootmgr -y
 
-        [[ ! -d /mnt/boot/efi ]] && error "Grub Install: no /mnt/boot/efi directory!!!"
+        [[ ! -d /mnt/boot/efi ]] && error $LINENO "Grub Install: no /mnt/boot/efi directory!!!"
         arch-chroot /mnt grub-install "$IN_DEVICE" --target=x86_64-efi --bootloader-id=GRUB --efi-directory=/boot/efi
 
         ## This next bit is for Ryzen systems with weird BIOS/EFI issues; --no-nvram and --removable might help
@@ -427,10 +486,8 @@ main() {
 
 	### Change keymap if necessary
 	if ! loadkeys "$default_keymap"; then
-        echo "Erro ao carregar layout de teclado: $default_keymap"
-        exit 1
+        error $LINENO "Erro ao carregar layout de teclado: $default_keymap" # Rastreia a linha onde o erro vai ocorrer
     fi
-
     # Checando a rede
     check_network_connection
 
@@ -466,6 +523,7 @@ main() {
     echo -e "\n\nSystem should now be installed and ready to boot!!!"
     echo && echo -e "\nType shutdown -h now and remove Installation Media and then reboot"
     echo && echo
+
 }
 
 main
